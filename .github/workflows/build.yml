@@ -58,8 +58,8 @@ jobs:
                   applicationId "com.vinylonair.teslabridge"
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 2
+                  versionName "2.0"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -132,14 +132,18 @@ jobs:
           import org.json.JSONObject
 
           class BridgeForegroundService : Service() {
+              companion object {
+                  var liveStatus: String = "In attesa..."
+                  var isServiceRunning: Boolean = false
+              }
+
               private lateinit var webView: WebView
               private val handler = Handler(Looper.getMainLooper())
-              private var isRunning = false
               private var roomId = "TESLA-DAVIDE"
 
               private val pollRunnable = object : Runnable {
                   override fun run() {
-                      if (!isRunning) return
+                      if (!isServiceRunning) return
                       readTidalAndSend()
                       handler.postDelayed(this, 1000)
                   }
@@ -149,7 +153,7 @@ jobs:
                   roomId = intent?.getStringExtra("ROOM_ID") ?: "TESLA-DAVIDE"
                   startForegroundNotification()
                   setupHiddenWebView()
-                  isRunning = true
+                  isServiceRunning = true
                   handler.post(pollRunnable)
                   return START_STICKY
               }
@@ -161,7 +165,7 @@ jobs:
                   mgr.createNotificationChannel(channel)
                   val notif = Notification.Builder(this, channelId)
                       .setContentTitle("VinylOnAir Tesla Bridge")
-                      .setContentText("Sync Tidal attivo ($roomId)")
+                      .setContentText("Sync MQTT attivo ($roomId)")
                       .setSmallIcon(android.R.drawable.ic_media_play)
                       .build()
                   startForeground(101, notif)
@@ -173,26 +177,29 @@ jobs:
                       settings.domStorageEnabled = true
                       webViewClient = WebViewClient()
                   }
-                  val targetId = "VOA-" + roomId.uppercase().replace(Regex("[^A-Z0-9-]"), "")
+                  val topic = "vinylonair/tesla/" + roomId.uppercase().replace(Regex("[^A-Z0-9-]"), "")
                   val html = """
                       <!DOCTYPE html>
                       <html>
-                      <head><script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script></head>
+                      <head><script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script></head>
                       <body>
                       <script>
-                        const peer = new Peer();
-                        let conn = null;
-                        function connectToTesla() {
-                          conn = peer.connect('$targetId', { reliable: true });
-                          conn.on('close', () => setTimeout(connectToTesla, 2000));
-                          conn.on('error', () => setTimeout(connectToTesla, 2000));
-                        }
-                        peer.on('open', connectToTesla);
-                        setInterval(() => {
-                          if (!conn || !conn.open) connectToTesla();
-                        }, 4000);
+                        const client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+                          clientId: 'voa_phone_' + Math.random().toString(16).substr(2, 8),
+                          clean: true,
+                          reconnectPeriod: 2000
+                        });
+                        window.mqttConnected = false;
+                        client.on('connect', () => { window.mqttConnected = true; });
+                        client.on('close', () => { window.mqttConnected = false; });
+                        client.on('offline', () => { window.mqttConnected = false; });
+
                         window.sendTrack = function(jsonStr) {
-                          if (conn && conn.open) conn.send(JSON.parse(jsonStr));
+                          if (client && client.connected) {
+                            client.publish('$topic', jsonStr, { qos: 0, retain: true });
+                            return "OK";
+                          }
+                          return "CONNECTING";
                         };
                       </script>
                       </body>
@@ -206,10 +213,22 @@ jobs:
                       val msm = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
                       val listener = ComponentName(this, TidalListenerService::class.java)
                       val controllers: List<MediaController> = msm.getActiveSessions(listener)
+
+                      if (controllers.isEmpty()) {
+                          liveStatus = "Nessun player attivo sul telefono"
+                          return
+                      }
+
                       val target = controllers.firstOrNull { it.packageName.contains("tidal", ignoreCase = true) }
-                          ?: controllers.firstOrNull() ?: return
-                      val meta = target.metadata ?: return
-                      val state = target.playbackState ?: return
+                          ?: controllers.first()
+
+                      val meta = target.metadata
+                      val state = target.playbackState
+                      if (meta == null || state == null) {
+                          liveStatus = "Player trovato (${target.packageName}) ma nessun brano"
+                          return
+                      }
+
                       val title = meta.getString(MediaMetadata.METADATA_KEY_TITLE) ?: return
                       val artist = meta.getString(MediaMetadata.METADATA_KEY_ARTIST)
                           ?: meta.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST) ?: ""
@@ -225,12 +244,22 @@ jobs:
                           put("isPlaying", isPlaying)
                       }
                       val escaped = payload.toString().replace("\\", "\\\\").replace("'", "\\'")
-                      webView.evaluateJavascript("if(window.sendTrack) window.sendTrack('$escaped');", null)
-                  } catch (e: SecurityException) {}
+                      webView.evaluateJavascript("window.sendTrack ? window.sendTrack('$escaped') : 'WAIT'") { res ->
+                          val cleanRes = res?.replace("\"", "") ?: ""
+                          liveStatus = if (cleanRes == "OK") {
+                              "Inviato: $artist - $title (${posSec.toInt()}s)"
+                          } else {
+                              "Letto: $artist - $title (Connessione cloud...)"
+                          }
+                      }
+                  } catch (e: SecurityException) {
+                      liveStatus = "ERRORE PERMESSO: attiva Accesso Notifiche!"
+                  }
               }
 
               override fun onDestroy() {
-                  isRunning = false
+                  isServiceRunning = false
+                  liveStatus = "Servizio fermo"
                   handler.removeCallbacks(pollRunnable)
                   if (::webView.isInitialized) webView.destroy()
                   super.onDestroy()
@@ -247,12 +276,24 @@ jobs:
           import android.content.Intent
           import android.graphics.Color
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.provider.Settings
           import android.view.Gravity
           import android.widget.*
 
           class MainActivity : Activity() {
-              private var active = false
+              private val uiHandler = Handler(Looper.getMainLooper())
+              private lateinit var statusText: TextView
+              private lateinit var btnToggle: Button
+
+              private val statusUpdater = object : Runnable {
+                  override fun run() {
+                      statusText.text = BridgeForegroundService.liveStatus
+                      btnToggle.text = if (BridgeForegroundService.isServiceRunning) "SYNC ATTIVO (Tocca per fermare)" else "2. AVVIA SYNC ORA"
+                      uiHandler.postDelayed(this, 800)
+                  }
+              }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -266,7 +307,7 @@ jobs:
                       setPadding(64, 64, 64, 64)
                   }
                   val title = TextView(this).apply {
-                      text = "VinylOnAir • Tesla Bridge"
+                      text = "VinylOnAir • Tesla Bridge v2"
                       textSize = 22f
                       setTextColor(Color.WHITE)
                       gravity = Gravity.CENTER
@@ -284,30 +325,44 @@ jobs:
                           startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                       }
                   }
-                  val btnToggle = Button(this).apply {
+                  btnToggle = Button(this).apply {
                       text = "2. AVVIA SYNC ORA"
                       textSize = 16f
                       setOnClickListener {
                           val room = input.text.toString().trim().uppercase().ifEmpty { "TESLA-DAVIDE" }
                           prefs.edit().putString("room", room).apply()
                           val svc = Intent(this@MainActivity, BridgeForegroundService::class.java)
-                          if (!active) {
+                          if (!BridgeForegroundService.isServiceRunning) {
                               svc.putExtra("ROOM_ID", room)
                               startForegroundService(svc)
-                              active = true
-                              text = "SYNC ATTIVO (Tocca per fermare)"
                           } else {
                               stopService(svc)
-                              active = false
-                              text = "2. AVVIA SYNC ORA"
                           }
                       }
                   }
+                  statusText = TextView(this).apply {
+                      text = "In attesa..."
+                      textSize = 14f
+                      setTextColor(Color.parseColor("#7DD3FC"))
+                      gravity = Gravity.CENTER
+                  }
+
                   root.addView(title)
-                  root.addView(input, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 40 })
-                  root.addView(btnPerm, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 40 })
-                  root.addView(btnToggle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 24 })
+                  root.addView(input, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 36 })
+                  root.addView(btnPerm, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 36 })
+                  root.addView(btnToggle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 20 })
+                  root.addView(statusText, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 36 })
                   setContentView(root)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  uiHandler.post(statusUpdater)
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  uiHandler.removeCallbacks(statusUpdater)
               }
           }
           EOF
@@ -320,5 +375,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: VOA-Tesla-Bridge
+          name: VOA-Tesla-Bridge-v2
           path: app/build/outputs/apk/debug/app-debug.apk
